@@ -1,190 +1,187 @@
-import asyncio
+import os
 import json
 import logging
-import os
+import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
 import aiofiles
+from pydantic import BaseModel, Field, ValidationError
 from langchain_community.chat_models import ChatZhipuAI
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field, ConfigDict
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
+    before_sleep_log,
 )
 
 
-# --- 配置中心 ---
-class Config:
-    INPUT_DIR = Path("./过滤结果")
-    OUTPUT_DIR = Path("./data/构筑结果")
-    LOG_DIR = Path("./Reconstruct_logs")
-    MAX_CONCURRENT = 5  # 适度增加并发
-    BATCH_SIZE = 5
-    MODEL_NAME = "glm-4.5-air"
+# --- 配置管理 (Pydantic Style) ---
+class Settings:
+    INPUT_DIR = Path("./data/Extracted")
+    OUTPUT_DIR = Path("./data/Filtered")
+    LOG_DIR = Path("./logs/Filter_logs")
     ZHI_PU_API_KEY = os.environ.get("ZHI_PU_API_KEY")
+    MODEL_NAME = "glm-4.6v-flashx"
+    MAX_CONCURRENT = 3
+    RETRY_ATTEMPTS = 3
 
     @classmethod
-    def setup(cls):
-        cls.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    def initialize(cls):
+        for path in [cls.OUTPUT_DIR, cls.LOG_DIR]:
+            path.mkdir(parents=True, exist_ok=True)
 
 
-Config.setup()
+Settings.initialize()
 
-# --- 日志配置 ---
-log_filename = datetime.now().strftime("Reconstruct_%Y%m%d_%H%M%S.log")
+# --- 日志系统 ---
+log_format = "%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format=log_format,
     handlers=[
-        logging.FileHandler(Config.LOG_DIR / log_filename, encoding="utf-8"),
+        logging.FileHandler(
+            Settings.LOG_DIR / datetime.now().strftime("filter_%Y%m%d.log"),
+            encoding="utf-8",
+        ),
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger("Reconstructor")
+logger = logging.getLogger(__name__)
 
 
 # --- 数据模型 ---
-class Pairs(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-    scene: str = Field(..., description="具体的对话场景描述")
-    input: str = Field(..., description="用户的话语")
-    output: str = Field(..., description="孙悟空的原始台词")
+class FilteredItem(BaseModel):
+    original_text: str = Field(..., description="符合筛选条件的原始台词文本")
+    reason: str = Field(..., description="简短说明该台词体现的性格维度或语气特征")
 
 
-class BatchPairs(BaseModel):
-    pairs: List[Pairs]
+class FilteredQuotes(BaseModel):
+    quotes: List[FilteredItem] = Field(
+        default_factory=list, description="筛选后的台词列表"
+    )
 
 
-# --- 系统提示词优化 ---
-SYSTEM_PROMPT = """你是一位精通《西游记》的对话专家。
-任务：根据给出的孙悟空单向台词（Output），反向构筑2个逻辑严密的对话场景。
-要求：
-1. 严格返回JSON格式。
-2. 每个Output必须对应2个不同的Scene和Input。
-3. 确保 scene, input, output 三个字段完整，不要合并字段。
+# --- 提示词工程优化 ---
+SYSTEM_PROMPT = """你是一位资深文学评论家。任务：从提供的对话列表中，筛选出能鲜明体现“{target_role}”性格特征的高质量语料。
+
+# Task
+1. **保留**：具有独特语气（如：俺老孙、呆子）、强烈情感、或体现身份背景的句子。
+2. **剔除**：通用废话（如“好的”、“你好”、“没问题”）、无上下文的碎片、以及不符合角色人设的句子。
+
+### 输出要求：
+必须返回有效的 JSON 对象，格式为：{{"quotes": [ {{"original_text": "...", "reason": "..."}} ]}}
 """
 
 
-# --- 核心逻辑类 ---
-class Reconstructor:
-    def __init__(self):
-        self.model = ChatZhipuAI(
-            model=Config.MODEL_NAME,
-            api_key=Config.ZHI_PU_API_KEY,
-            temperature=0.7,
-            timeout=120,
-        ).with_structured_output(BatchPairs)
-
-        self.prompt = ChatPromptTemplate.from_messages(
-            [("system", SYSTEM_PROMPT), ("human", "请根据以下台词构筑对话：\n{text}")]
+class RoleQuoteFilter:
+    def __init__(self, target_role: str):
+        self.target_role = target_role
+        # 初始化模型并绑定结构化输出
+        llm = ChatZhipuAI(
+            model=Settings.MODEL_NAME,
+            api_key=Settings.ZHI_PU_API_KEY,
+            temperature=0.1,
+            timeout=100,
         )
-        self.chain = self.prompt | self.model
-        self.semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT)
+        self.chain = ChatPromptTemplate.from_messages(
+            [("system", SYSTEM_PROMPT), ("human", "待筛选列表：\n{text}")]
+        ) | llm.with_structured_output(FilteredQuotes)
+
+        self.semaphore = asyncio.Semaphore(Settings.MAX_CONCURRENT)
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(Exception),
-        reraise=True,
+        stop=stop_after_attempt(Settings.RETRY_ATTEMPTS),
+        wait=wait_exponential(multiplier=2, min=4, max=20),
+        retry=retry_if_exception_type((Exception)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=False,  # 关键：耗尽重试后不抛出异常，由函数内部处理
     )
-    async def call_llm(self, combined_text: str) -> BatchPairs:
-        """带重试机制的LLM调用"""
-        return await self.chain.ainvoke({"text": combined_text})
+    async def _call_llm_core(self, text_input: str) -> Optional[FilteredQuotes]:
+        """核心调用逻辑，处理模型返回的结构化数据"""
+        return await self.chain.ainvoke(
+            {"target_role": self.target_role, "text": text_input}
+        )
 
-    async def process_batch(
-        self, file_path: Path, batch_idx: int, quotes: List[str]
-    ) -> dict:
+    async def process_file(self, file_path: Path) -> dict:
+        """单文件处理逻辑"""
         async with self.semaphore:
-            start_t = time.perf_counter()
-            report = {
-                "filename": file_path.name,
-                "count": 0,
-                "status": "FAILED",
-                "duration": 0,
-            }
-
+            stats = {"file": file_path.name, "status": "INIT", "saved": 0}
             try:
-                combined_input = "\n".join(
-                    [f"台词{i + 1}: {q}" for i, q in enumerate(quotes)]
-                )
-                result = await self.call_llm(combined_input)
+                # 1. 安全读取
+                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                    content = await f.read()
+                    if not content.strip():
+                        raise ValueError("Empty file")
+                    raw_data = json.loads(content)
+                    quotes = raw_data.get("quotes", [])
 
-                if result and result.pairs:
-                    await self.save_to_jsonl(file_path, result.pairs)
-                    report.update(
-                        {
-                            "status": "SUCCESS",
-                            "count": len(result.pairs),
-                            "duration": time.perf_counter() - start_t,
-                        }
+                if not quotes:
+                    stats["status"] = "SKIPPED"
+                    return stats
+
+                # 2. 调用 LLM
+                logger.info(f"Processing {file_path.name} ({len(quotes)} quotes)...")
+                # 将列表转为带编号的文本，有助于 LLM 定位
+                formatted_input = "\n".join([f"- {q}" for q in quotes])
+
+                result = await self._call_llm_core(formatted_input)
+
+                # 3. 结果校验与保存
+                if result and isinstance(result, FilteredQuotes):
+                    await self._save_result(file_path, result)
+                    stats.update({"status": "SUCCESS", "saved": len(result.quotes)})
+                else:
+                    stats["status"] = "LLM_ERROR"
+                    logger.error(
+                        f"Failed to get valid structured output for {file_path.name}"
                     )
-                    logger.info(
-                        f"OK: {file_path.name} Batch {batch_idx + 1} (+{len(result.pairs)})"
-                    )
+
+            except json.JSONDecodeError:
+                stats["status"] = "JSON_CORRUPT"
+                logger.error(f"Invalid JSON format in {file_path.name}")
             except Exception as e:
-                logger.error(
-                    f"ERR: {file_path.name} Batch {batch_idx + 1} | {type(e).__name__}: {e}"
-                )
+                stats["status"] = "ERROR"
+                logger.error(f"Unexpected error processing {file_path.name}: {str(e)}")
 
-            return report
+            return stats
 
-    async def save_to_jsonl(self, file_path: Path, pairs: List[Pairs]):
-        output_path = Config.OUTPUT_DIR / f"{file_path.stem}_reconstructed.jsonl"
-        async with aiofiles.open(output_path, "a", encoding="utf-8") as f:
-            lines = [json.dumps(p.model_dump(), ensure_ascii=False) for p in pairs]
-            await f.write("\n".join(lines) + "\n")
+    async def _save_result(self, original_path: Path, data: FilteredQuotes):
+        output_path = Settings.OUTPUT_DIR / f"{original_path.stem}_filtered.json"
+        async with aiofiles.open(output_path, "w", encoding="utf-8") as f:
+            await f.write(data.model_dump_json(indent=4, build_as_node=True))
 
     async def run(self):
-        files = sorted(list(Config.INPUT_DIR.glob("*.json")))
-        if not files:
-            logger.warning("No input files found.")
+        input_files = sorted(Settings.INPUT_DIR.glob("*.json"))
+        if not input_files:
+            logger.warning("No files found in input directory.")
             return
 
-        tasks = []
-        for file_path in files:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-                data = json.loads(await f.read())
-                quotes = [
-                    item["original_text"]
-                    for item in data.get("selected_quotes", [])
-                    if item.get("original_text")
-                ]
-
-                for i in range(0, len(quotes), Config.BATCH_SIZE):
-                    tasks.append(
-                        self.process_batch(
-                            file_path,
-                            i // Config.BATCH_SIZE,
-                            quotes[i : i + Config.BATCH_SIZE],
-                        )
-                    )
-
-        logger.info(f"Task Started: {len(files)} files, {len(tasks)} batches.")
         start_time = time.perf_counter()
-
-        # 使用 gather 获取所有结果用于最后统计
+        tasks = [self.process_file(f) for f in input_files]
         results = await asyncio.gather(*tasks)
 
-        # 统计分析
-        total_time = time.perf_counter() - start_time
-        success_pairs = sum(r["count"] for r in results if r["status"] == "SUCCESS")
+        # 统计
+        duration = time.perf_counter() - start_time
+        success_files = [r for r in results if r["status"] == "SUCCESS"]
+
         logger.info(f"""
-{"=" * 30}
-Final Report:
-- Total Time: {total_time:.2f}s
-- Success Pairs: {success_pairs}
-- Avg Throughput: {success_pairs / total_time:.2f} pairs/s
-{"=" * 30}
+{"=" * 40}
+PROCESSING COMPLETE
+Total Files: {len(input_files)}
+Success: {len(success_files)}
+Failed/Skipped: {len(input_files) - len(success_files)}
+Total Time: {duration:.2f}s
+Avg Speed: {duration / len(input_files):.2f}s/file
+{"=" * 40}
 """)
 
 
 if __name__ == "__main__":
-    reconstructor = Reconstructor()
-    asyncio.run(reconstructor.run())
+    # 使用更具体的角色描述有助于 LLM 过滤
+    processor = RoleQuoteFilter("《西游记》中的孙悟空（齐天大圣）")
+    asyncio.run(processor.run())
