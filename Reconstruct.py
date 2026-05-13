@@ -4,6 +4,7 @@ import aiofiles
 import time
 import json
 import logging
+from langchain_openai import ChatOpenAI
 from langchain_community.chat_models import ChatZhipuAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -23,8 +24,9 @@ class Config:
     LOG_DIR = Path("./logs/Reconstruct_logs")
     MAX_CONCURRENT = 2
     BATCH_SIZE = 5
-    MODEL_NAME = "glm-4.5-air"
-    ZHI_PU_API_KEY = os.environ.get("ZHI_PU_API_KEY")
+    MODEL_NAME = "qwen3.5-plus"
+    QWEN_API = os.environ.get("QWEN_API")
+    BASE_URL = "https://coding.dashscope.aliyuncs.com/v1"
 
     @classmethod
     def setup(cls):
@@ -49,21 +51,28 @@ logger = logging.getLogger(__name__)
 system_prompt = """
 # Role
 你是一位金牌编剧和对话构筑专家，擅长从一句台词（Output）反向推导其背后的情感冲突、人物关系及特定场景。
+
 # Task
 我会给你一批台词（Output）。请你通过反向推理，分别给每一个台词构筑 2 个极具真实感、能够自然引出这句台词的对话数据。
+
+# Output Format
+你必须严格按照以下JSON格式返回，不要输出其他任何内容：
+{{"pairs":[{{"scene":"场景描述","input":"用户话语","output":"原始台词"}}]}}
+
 # Constraints
-1. **场景多样性（Scene）**: 两个场景必须有明显的差异。例如：场景一可以是“冲突对峙”，场景二可以是“日常请教等”。
-2. **逻辑契合（Input -> Output）**: Input 必须包含引爆点（Trigger）。这个引爆点可以是对方的质疑、挑衅、请求或误解，从而迫使角色说出那句 Output。
+1. **场景多样性（Scene）**: 两个场景必须有明显的差异。例如：场景一可以是"冲突对峙"，场景二可以是"日常请教等"。
+2. **逻辑契合（Input -> Output）**: Input 必须是引出角色说出那句 Output的话。
 3. **口语化与情绪化**: Input 的语言风格要符合场景设定，避免死板的叙述。如果 Output 情绪激烈，Input 也应具备相应的情绪张力。
+
 # Work Flow
 1. **情感分析**: 分析 Output 的情绪（狂傲、谦卑、兴奋、愤怒还是执着）。
 2. **场景构筑**: 根据 Output 的情绪，构筑两个具有明显差异的场景。
 3. **话语构筑**: 编写能够自然闭环的 Input。
+
 # Example
-**User Input**: “俺老孙上天入地，无所不能，怎么去不得！”
-**Output**: 
-{{"scene": "取经团队来到一处瘴气弥漫的绝地，猪八戒因畏难情绪在一旁冷嘲热讽，质疑孙悟空也没法带大家过去。", "input": "猴哥，这地方连神仙都要绕道，你那点本事怕是也悬，咱们还是散伙分行李吧！", "output": "俺老孙上天入地，无所不能，怎么去不得！"}}
-{{"scene": "孙悟空前往禁地求药，守护灵兽见他并无仙职，阻拦其入内并出言轻视。", "input": "此乃神圣之地，非大罗金仙不得入内。你这野猴，莫要白白送了性命，快快退去！", "output": "俺老孙上天入地，无所不能，怎么去不得！"}}
+输入台词："俺老孙上天入地，无所不能，怎么去不得！"
+输出：
+{{"pairs":[{{"scene":"取经团队来到一处瘴气弥漫的绝地，猪八戒因畏难情绪在一旁冷嘲热讽，质疑孙悟空也没法带大家过去。","input":"猴哥，这地方连神仙都要绕道，你那点本事怕是也悬，咱们还是散伙分行李吧！","output":"俺老孙上天入地，无所不能，怎么去不得！"}},{{"scene":"孙悟空前往禁地求药，守护灵兽见他并无仙职，阻拦其入内并出言轻视。","input":"此乃神圣之地，非大罗金仙不得入内。你这野猴，莫要白白送了性命，快快退去！","output":"俺老孙上天入地，无所不能，怎么去不得！"}}]}}
 """
 
 
@@ -80,12 +89,13 @@ class BatchPairs(BaseModel):
 
 class Reconstructor:
     def __init__(self):
-        self.model = ChatZhipuAI(
+        self.model = ChatOpenAI(
             model=Config.MODEL_NAME,
-            api_key=Config.ZHI_PU_API_KEY,
+            api_key=Config.QWEN_API,
+            base_url=Config.BASE_URL,
             temperature=0.7,
             timeout=300,
-        ).with_structured_output(BatchPairs)
+        )
 
         self.prompt = ChatPromptTemplate.from_messages(
             [("system", system_prompt), ("human", "{text}")]
@@ -101,7 +111,19 @@ class Reconstructor:
     )
     async def call_llm(self, text: str) -> BatchPairs:
         """LLM调用"""
-        return await self.chain.ainvoke({"text": text})
+        result = await self.chain.ainvoke({"text": text})
+        content = str(result.content)
+
+        import re
+
+        json_match = re.search(r"\{[\s\S]*\}", content)
+        if json_match:
+            json_str = json_match.group()
+        else:
+            json_str = content
+
+        parsed = json.loads(json_str)
+        return BatchPairs.model_validate(parsed)
 
     async def process_batch(
         self, file_path: Path, batch_idx: int, quotes: list[str]

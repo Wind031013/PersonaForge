@@ -1,110 +1,74 @@
+
+import os
+import re
+import time
 import requests
 from bs4 import BeautifulSoup
-import os
-import time
-import random
-from urllib.parse import urljoin
 
-class NovelDownloader:
-    def __init__(self, start_url, output_dir):
-        self.start_url = start_url
-        self.output_dir = output_dir
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://5000yan.com/'
-        }
-        # 创建输出目录
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
+def get_novel_content():
+    # 创建保存数据的文件夹
+    if not os.path.exists('data'):
+        os.makedirs('data')
 
-    def get_html(self, url):
-        """带重试机制的请求函数"""
-        for i in range(3):
-            try:
-                time.sleep(random.uniform(1.0, 2.0))  # 尊重的限速 
-                resp = requests.get(url, headers=self.headers, timeout=15)
-                resp.encoding = 'utf-8'
-                if resp.status_code == 200:
-                    return resp.text
-            except Exception as e:
-                print(f"请求异常 ({i+1}/3): {url}, 错误: {e}")
-        return None
+    # 读取章节链接文件
+    chapters = []
+    with open('chapter_url.txt', 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # 使用正则匹配 [章节名](链接) 格式
+            pattern = re.compile(r'\[(.*?)\]\((.*?)\)')
+            match = pattern.search(line)
+            if match:
+                title = match.group(1)
+                url = match.group(2)
+                chapters.append((title, url))
 
-    def parse_and_save(self):
-        current_url = self.start_url
-        chapter_count = 1  # 用于命名文件：1.txt, 2.txt...
+    # 设置请求头
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
 
-        while current_url:
-            print(f"正在处理第 {chapter_count} 章: {current_url}")
-            html = self.get_html(current_url)
-            if not html:
-                print("无法获取网页内容，停止。")
-                break
-
-            soup = BeautifulSoup(html, 'lxml')
-
-            # 1. 提取标题 [cite: 13]
-            title_tag = soup.find('h5', class_='text-center')
-            title = title_tag.get_text(strip=True) if title_tag else f"第{chapter_count}章"
-
-            # 2. 提取正文逻辑 
-            # 网站正文分布在 class='grap' 的 div 及其后续同级 div 中
-            content_parts = []
+    # 遍历所有章节
+    for title, url in chapters:
+        try:
+            print(f"正在下载: {title} - {url}")
+            response = requests.get(url, headers=headers, timeout=10)
+            response.encoding = 'utf-8'
             
-            # 提取主要正文块 
-            main_grap = soup.find('div', class_='grap')
-            if main_grap:
-                # 移除内部的图片和无用标签 [cite: 14, 15]
-                for tag in main_grap.find_all(['img', 'script', 'style']):
-                    tag.decompose()
-                content_parts.append(main_grap.get_text(separator='\n', strip=True))
-
-            # 提取后续可能的段落 div（针对该站某些章节内容分散的情况）
-            # 查找 h5 标题之后的所有 div，直到遇到翻页容器为止
-            if main_grap:
-                for sibling in main_grap.find_next_siblings('div'):
-                    if 'container' in sibling.get('class', []) or 'pcfzsc' in sibling.get('class', []):
-                        break
-                    # 排除评论区和无关组件 [cite: 20, 28]
-                    if not any(cls in sibling.get('class', []) for cls in ['wqy-pl', 'blog-footer']):
-                        txt = sibling.get_text(strip=True)
-                        if txt: content_parts.append(txt)
-
-            full_content = "\n\n".join(content_parts)
-
-            # 3. 实时保存为独立文件
-            file_name = f"{chapter_count}.txt"
-            file_path = os.path.join(self.output_dir, file_name)
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(f"{title}\n\n")
-                f.write(full_content)
-            
-            print(f"成功保存: {file_name}")
-
-            # 4. 精准寻找“下一篇”链接 
-            next_url = None
-            # 找到包含“下一篇：”文字的 div 容器 
-            footer_divs = soup.find_all('div', class_='text-truncate')
-            for div in footer_divs:
-                if '下一篇：' in div.get_text():
-                    a_tag = div.find('a')
-                    if a_tag and a_tag.get('href'):
-                        next_url = urljoin(current_url, a_tag['href'])
-                        break
-            
-            # 更新循环变量
-            if next_url:
-                current_url = next_url
-                chapter_count += 1
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # 根据HTML结构解析正文内容
+                # 正文在 div.book_content 下的 div.content 中
+                content_div = soup.select_one('.book_content .content')
+                
+                if content_div:
+                    paragraphs = content_div.find_all('p')
+                    full_text = ""
+                    for p in paragraphs:
+                        # 提取段落文本并保留换行
+                        text = p.get_text()
+                        full_text += text + "\n\n"
+                    
+                    # 构造文件名
+                    filename = os.path.join('data', f"{title}.txt")
+                    
+                    # 保存文件
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(full_text.strip())
+                    print(f"保存成功: {filename}")
+                else:
+                    print(f"未找到正文内容: {url}")
             else:
-                print("全部章节采集完成。")
-                current_url = None
+                print(f"请求失败，状态码: {response.status_code}")
+            
+            # 延时，避免请求过快
+            time.sleep(1)
+            
+        except Exception as e:
+            print(f"下载出错: {title}, 错误信息: {e}")
 
-if __name__ == "__main__":
-    # 配置区
-    ENTRY_URL = "https://xiyouji.5000yan.com/qsn/1249.html"  # 第一回 [cite: 13]
-    TARGET_FOLDER = "西游记_章节分块"
-    
-    downloader = NovelDownloader(ENTRY_URL, TARGET_FOLDER)
-    downloader.parse_and_save()
+if __name__ == '__main__':
+    get_novel_content()
