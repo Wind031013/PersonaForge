@@ -16,3 +16,11 @@ logs
 # others
 temp
 test
+chapter_url.txt
+plan.md
+
+# data
+data/
+extras/
+filter/
+refactor/

@@ -6,7 +6,7 @@ from utils.config import Config
 from utils.logger import setup_logger
 from utils.tools import load_text, save_json, load_json, process_file, method
 from tenacity import retry, stop_after_attempt, wait_exponential
-from crawler.crawler_agent import Crawler
+from utils.crawler_agent import Crawler
 
 logger = setup_logger(__name__)
 
